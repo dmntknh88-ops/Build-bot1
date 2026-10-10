@@ -4,26 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       jobId:
+        description: Job ID
         required: true
         type: string
       userId:
+        description: User ID
         required: true
         type: string
       payload:
+        description: JSON payload
         required: true
         type: string
-      assetId:
-        required: false
-        type: string
-        default: ''
-      releaseTag:
-        required: false
-        type: string
-        default: ''
-      downloadToken:
-        required: false
-        type: string
-        default: ''
 
 env:
   JAVA_VERSION: '17'
@@ -43,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve download params
+      - name: Parse payload
         id: meta
         env:
           PAYLOAD_JSON: ${{ inputs.payload }}
@@ -54,32 +45,38 @@ jobs:
           import json, os
           try:
             p = json.load(open('/tmp/payload.json'))
-          except Exception:
+          except Exception as e:
+            print('payload parse error', e)
             p = {}
           def g(*ks):
             for k in ks:
               v = p.get(k)
-              if v is not None and str(v).strip():
+              if v is not None and str(v).strip() != '':
                 return str(v).strip()
             return ''
-          asset = g('assetId', 'asset_id') or os.environ.get('INPUT_ASSETID', '') or '${{ inputs.assetId }}'
-          tag = g('zipReleaseTag', 'release_tag', 'releaseTag') or os.environ.get('INPUT_RELEASETAG', '') or '${{ inputs.releaseTag }}'
+          asset = g('assetId', 'asset_id')
+          tag = g('zipReleaseTag', 'releaseTag', 'release_tag')
           repo = g('repo') or os.environ.get('GITHUB_REPOSITORY', '')
+          token = g('downloadToken', 'token', 'ghToken')
+          app = g('appName', 'app_name') or 'MyApp'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
             f.write(f'asset_id={asset}\n')
             f.write(f'release_tag={tag}\n')
             f.write(f'repo={repo}\n')
-            f.write(f'app_name={g("appName", "app_name") or "MyApp"}\n')
+            f.write(f'app_name={app}\n')
+          # token ke GITHUB_ENV (jangan echo)
+          if token:
+            with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f'DL_TOKEN={token}\n')
           print('asset_id=', asset)
           print('release_tag=', tag)
           print('repo=', repo)
+          print('has_token=', 'yes' if token else 'no')
           PY
 
-      # UNDUH ZIP DULU (sebelum SDK) biar gagal cepat + jelas
       - name: Download project ZIP from GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PAT_TOKEN: ${{ inputs.downloadToken }}
           ASSET_ID: ${{ steps.meta.outputs.asset_id }}
           RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
           REPO_NAME: ${{ steps.meta.outputs.repo }}
@@ -89,8 +86,7 @@ jobs:
           REPO="${REPO_NAME:-$GITHUB_REPOSITORY}"
           TAG="${RELEASE_TAG:-}"
           AID="${ASSET_ID:-}"
-          # Token: PAT worker (yang upload) prioritas, fallback GITHUB_TOKEN
-          TOKEN="${PAT_TOKEN:-$GH_TOKEN}"
+          TOKEN="${DL_TOKEN:-$GH_TOKEN}"
           if [ -z "$TOKEN" ]; then TOKEN="$GH_TOKEN"; fi
 
           echo "REPO=$REPO TAG=$TAG ASSET_ID=$AID token_len=${#TOKEN}"
@@ -107,9 +103,7 @@ jobs:
               "https://api.github.com/repos/${REPO}/releases/assets/${id}" || echo "000")
             SZ=$(stat -c%s "$out" 2>/dev/null || echo 0)
             echo "HTTP=$HTTP size=$SZ"
-            # deteksi HTML error
-            if head -c 20 "$out" 2>/dev/null | grep -qi '<!doctype\|<html\|{"message"'; then
-              echo "Response looks like error page/json"
+            if head -c 30 "$out" 2>/dev/null | grep -qiE '<!doctype|<html|\{"message"'; then
               head -c 300 "$out" || true
               return 1
             fi
@@ -117,13 +111,10 @@ jobs:
           }
 
           OK=0
-
-          # 1) by asset id
-          if [ -n "$AID" ] && [ "$AID" != "" ]; then
+          if [ -n "$AID" ]; then
             if download_asset "$AID" project.zip; then OK=1; fi
           fi
 
-          # 2) resolve id from tag
           if [ "$OK" -eq 0 ] && [ -n "$TAG" ]; then
             echo "Resolve asset from tag $TAG"
             REL=$(curl -sS -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" \
@@ -142,7 +133,6 @@ except Exception:
             fi
           fi
 
-          # 3) gh release download
           if [ "$OK" -eq 0 ] && [ -n "$TAG" ]; then
             echo "Try gh release download"
             GH_TOKEN="$TOKEN" gh release download "$TAG" -R "$REPO" -p "project.zip" -D . && OK=1 || true
@@ -153,10 +143,9 @@ except Exception:
           fi
 
           if [ "$OK" -eq 0 ]; then
-            echo "FATAL download failed" | tee /tmp/download_error.txt
-            echo "REPO=$REPO TAG=$TAG AID=$AID" >> /tmp/download_error.txt
+            echo "FATAL download failed"
             curl -sS -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/releases?per_page=3" | head -c 1500 | tee -a /tmp/download_error.txt || true
+              "https://api.github.com/repos/${REPO}/releases?per_page=3" | head -c 1500 || true
             exit 1
           fi
 
