@@ -15,6 +15,8 @@ on:
         description: JSON payload
         required: true
         type: string
+  repository_dispatch:
+    types: [web2apk-build, web2apk-build-flutter]
 
 env:
   JAVA_VERSION: '17'
@@ -30,6 +32,11 @@ jobs:
     permissions:
       contents: read
       actions: write
+    # Skip if android-only event
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.action == 'web2apk-build' ||
+      github.event.action == 'web2apk-build-flutter'
 
     steps:
       - uses: actions/checkout@v4
@@ -37,17 +44,28 @@ jobs:
       - name: Parse payload
         id: meta
         env:
-          PAYLOAD_JSON: ${{ inputs.payload }}
+          PAYLOAD_JSON: ${{ github.event_name == 'repository_dispatch' && toJson(github.event.client_payload) || inputs.payload }}
+          INPUT_JOB: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.jobId || inputs.jobId }}
         run: |
           set -e
           printf '%s' "$PAYLOAD_JSON" > /tmp/payload.json
+          # repository_dispatch client_payload may already be object stringified by toJson
           python3 << 'PY'
           import json, os
+          raw = open('/tmp/payload.json').read().strip()
           try:
-            p = json.load(open('/tmp/payload.json'))
-          except Exception as e:
-            print('payload parse error', e)
+            p = json.loads(raw) if raw else {}
+          except Exception:
             p = {}
+          # client_payload sometimes nests payload
+          if 'payload' in p and isinstance(p.get('payload'), str):
+            try:
+              inner = json.loads(p['payload'])
+              p = {**p, **inner}
+            except Exception:
+              pass
+          elif 'payload' in p and isinstance(p.get('payload'), dict):
+            p = {**p, **p['payload']}
           def g(*ks):
             for k in ks:
               v = p.get(k)
@@ -59,18 +77,20 @@ jobs:
           repo = g('repo') or os.environ.get('GITHUB_REPOSITORY', '')
           token = g('downloadToken', 'token', 'ghToken')
           app = g('appName', 'app_name') or 'MyApp'
+          job_id = g('jobId', 'job_id') or os.environ.get('INPUT_JOB', '')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
             f.write(f'asset_id={asset}\n')
             f.write(f'release_tag={tag}\n')
             f.write(f'repo={repo}\n')
             f.write(f'app_name={app}\n')
-          # token ke GITHUB_ENV (jangan echo)
+            f.write(f'job_id={job_id}\n')
           if token:
             with open(os.environ['GITHUB_ENV'], 'a') as f:
               f.write(f'DL_TOKEN={token}\n')
           print('asset_id=', asset)
           print('release_tag=', tag)
           print('repo=', repo)
+          print('job_id=', job_id)
           print('has_token=', 'yes' if token else 'no')
           PY
 
@@ -88,13 +108,11 @@ jobs:
           AID="${ASSET_ID:-}"
           TOKEN="${DL_TOKEN:-$GH_TOKEN}"
           if [ -z "$TOKEN" ]; then TOKEN="$GH_TOKEN"; fi
-
           echo "REPO=$REPO TAG=$TAG ASSET_ID=$AID token_len=${#TOKEN}"
 
           download_asset() {
             local id="$1"
             local out="$2"
-            echo "GET releases/assets/$id"
             HTTP=$(curl -sS -L --retry 3 --retry-delay 2 \
               -o "$out" -w "%{http_code}" \
               -H "Authorization: Bearer ${TOKEN}" \
@@ -114,12 +132,9 @@ jobs:
           if [ -n "$AID" ]; then
             if download_asset "$AID" project.zip; then OK=1; fi
           fi
-
           if [ "$OK" -eq 0 ] && [ -n "$TAG" ]; then
-            echo "Resolve asset from tag $TAG"
             REL=$(curl -sS -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/releases/tags/${TAG}" || true)
-            echo "$REL" | head -c 400
             AID2=$(python3 -c "import json,sys
 try:
  d=json.load(sys.stdin)
@@ -127,30 +142,19 @@ try:
 except Exception:
  print('')
 " <<<"$REL")
-            echo "AID2=$AID2"
             if [ -n "$AID2" ]; then
               if download_asset "$AID2" project.zip; then OK=1; fi
             fi
           fi
-
           if [ "$OK" -eq 0 ] && [ -n "$TAG" ]; then
-            echo "Try gh release download"
             GH_TOKEN="$TOKEN" gh release download "$TAG" -R "$REPO" -p "project.zip" -D . && OK=1 || true
-            if [ -f project.zip ]; then
-              SZ=$(stat -c%s project.zip)
-              if [ "$SZ" -gt 10000 ]; then OK=1; else rm -f project.zip; OK=0; fi
-            fi
+            if [ -f project.zip ] && [ "$(stat -c%s project.zip)" -gt 10000 ]; then OK=1; else rm -f project.zip; OK=0; fi
           fi
-
           if [ "$OK" -eq 0 ]; then
-            echo "FATAL download failed"
-            curl -sS -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/releases?per_page=3" | head -c 1500 || true
+            echo "FATAL: ZIP download failed"
             exit 1
           fi
-
-          SZ=$(stat -c%s project.zip)
-          echo "ZIP OK size=$SZ"
+          echo "ZIP OK size=$(stat -c%s project.zip)"
           unzip -q project.zip -d project_src
           if [ "$(find project_src -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1 ] && \
              [ "$(find project_src -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0 ]; then
@@ -173,8 +177,7 @@ except Exception:
           ANDROID_ROOT="$HOME/android-sdk"
           mkdir -p "$ANDROID_ROOT/cmdline-tools"
           cd /tmp
-          curl -fsSL -o cmdtools.zip \
-            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          curl -fsSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip -q cmdtools.zip -d "$ANDROID_ROOT/cmdline-tools"
           rm -rf "$ANDROID_ROOT/cmdline-tools/latest"
           mv "$ANDROID_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_ROOT/cmdline-tools/latest"
@@ -185,10 +188,7 @@ except Exception:
           export ANDROID_HOME="$ANDROID_ROOT"
           export PATH="$ANDROID_ROOT/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-${{ env.ANDROID_API_LEVEL }}" \
-            "build-tools;${{ env.ANDROID_BUILD_TOOLS }}"
+          sdkmanager --install "platform-tools" "platforms;android-${{ env.ANDROID_API_LEVEL }}" "build-tools;${{ env.ANDROID_BUILD_TOOLS }}"
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -206,7 +206,7 @@ except Exception:
           else
             FOUND=$(find project_src -name pubspec.yaml -type f | head -1)
             if [ -z "$FOUND" ]; then
-              echo "pubspec.yaml tidak ada"
+              echo "pubspec.yaml tidak ada — bukan project Flutter?"
               find project_src -maxdepth 4 -type f | head -60
               exit 1
             fi
@@ -221,14 +221,12 @@ except Exception:
         working-directory: ${{ steps.proj.outputs.dir }}
         run: |
           set -e
-          flutter build apk --release
+          flutter build apk --release 2>&1 | tee /tmp/flutter_build.log
           APK=$(find build/app/outputs/flutter-apk -name '*.apk' -type f | head -1)
-          if [ -z "$APK" ]; then
-            APK=$(find build -name '*.apk' -type f | head -1)
-          fi
+          if [ -z "$APK" ]; then APK=$(find build -name '*.apk' -type f | head -1); fi
           if [ -z "$APK" ]; then
             echo "APK tidak ditemukan"
-            find build -type f | head -40
+            tail -100 /tmp/flutter_build.log || true
             exit 1
           fi
           cp "$APK" "$GITHUB_WORKSPACE/app-release.apk"
@@ -236,7 +234,7 @@ except Exception:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ inputs.jobId }}
+          name: apk-${{ steps.meta.outputs.job_id }}
           path: app-release.apk
           if-no-files-found: error
           retention-days: 3
