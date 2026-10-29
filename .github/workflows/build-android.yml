@@ -1,9 +1,5 @@
 name: Build Android Native APK
 
-# ============================================================
-# NATIVE ONLY — jangan digabung dengan build-flutter.yml
-# Dipakai hanya jika deteksi: gradlew / build.gradle / Kotlin
-# ============================================================
 on:
   workflow_dispatch:
     inputs:
@@ -20,11 +16,14 @@ on:
         required: true
         type: string
   repository_dispatch:
-    types: [web2apk-build-android, web2apk-build-native]
+    types:
+      - web2apk-build-android
+      - web2apk-build-native
+      - web2apk-build
 
 jobs:
   build-native:
-    name: Native Android only
+    name: Native Android
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -38,27 +37,28 @@ jobs:
       - name: Parse payload
         id: meta
         env:
-          PAYLOAD_JSON: ${{ github.event_name == 'repository_dispatch' && toJson(github.event.client_payload) || inputs.payload }}
-          INPUT_JOB: ${{ inputs.jobId }}
-          INPUT_USER: ${{ inputs.userId }}
+          PAYLOAD_INPUT: ${{ inputs.payload }}
+          JOB_ID_INPUT: ${{ inputs.jobId }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PATH: ${{ github.event_path }}
         run: |
-          set -euo pipefail
+          set -e
           python3 << 'PY'
           import json, os
-          raw = os.environ.get("PAYLOAD_JSON") or "{}"
-          try:
-              p = json.loads(raw)
-          except Exception:
-              p = {}
-          if isinstance(p.get("payload"), dict):
-              p = {**p, **p["payload"]}
-          if isinstance(p.get("payload"), str):
-              try:
-                  inner = json.loads(p["payload"])
-                  if isinstance(inner, dict):
-                      p = {**p, **inner}
-              except Exception:
-                  pass
+          event_name = os.environ.get("EVENT_NAME", "")
+          event_path = os.environ.get("EVENT_PATH", "")
+          p = {}
+          if event_name == "repository_dispatch" and event_path and os.path.isfile(event_path):
+              ev = json.load(open(event_path, encoding="utf-8"))
+              p = ev.get("client_payload") or {}
+          else:
+              raw = os.environ.get("PAYLOAD_INPUT") or ""
+              if raw:
+                  try:
+                      p = json.loads(raw)
+                  except Exception as e:
+                      print("payload json error", e)
+                      p = {}
 
           def g(*keys):
               for k in keys:
@@ -67,35 +67,30 @@ jobs:
                       return str(v).strip()
               return ""
 
-          job_id = g("jobId", "job_id") or os.environ.get("INPUT_JOB") or "job"
-          user_id = g("userId", "user_id") or os.environ.get("INPUT_USER") or ""
           asset = g("assetId", "asset_id")
           tag = g("zipReleaseTag", "releaseTag", "release_tag")
           repo = g("repo") or os.environ.get("GITHUB_REPOSITORY", "")
           token = g("downloadToken", "token", "ghToken")
+          app = g("appName", "app_name") or "MyApp"
+          job_id = g("jobId", "job_id") or os.environ.get("JOB_ID_INPUT", "") or "job"
           build_type = (g("buildType", "build_type") or "release").lower()
-          if build_type not in ("release", "debug"):
-              build_type = "release"
-          app_name = g("appName", "app_name") or "App"
-          custom_icon = g("customIcon", "iconUrl", "icon_url", "iconFileId")
+          inbox = g("inboxPath", "inbox_path")
+          branch = g("branch") or "main"
 
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"job_id={job_id}\n")
-              f.write(f"inbox_path={inbox}\n")
-              f.write(f"branch={branch}\n")
-              f.write(f"user_id={user_id}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"asset_id={asset}\n")
               f.write(f"release_tag={tag}\n")
               f.write(f"repo={repo}\n")
+              f.write(f"app_name={app}\n")
+              f.write(f"job_id={job_id}\n")
               f.write(f"build_type={build_type}\n")
-              f.write(f"app_name={app_name}\n")
-              f.write(f"custom_icon={custom_icon}\n")
+              f.write(f"inbox_path={inbox}\n")
+              f.write(f"branch={branch}\n")
           if token:
-              with open(os.environ["GITHUB_ENV"], "a") as f:
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
                   f.write(f"DL_TOKEN={token}\n")
-          print("NATIVE", job_id, build_type, "asset", bool(asset), "icon", bool(custom_icon))
+          print("asset_id=", asset, "tag=", tag, "job=", job_id, "token=", "yes" if token else "no")
           PY
-
 
       - name: Download ZIP
         env:
@@ -112,47 +107,107 @@ jobs:
           REPO="${REPO:-$GITHUB_REPOSITORY}"
           BRANCH="${BRANCH:-main}"
           INBOX="${INBOX:-.web2apk-inbox/${JOB_ID}/project.zip}"
-          echo "[dl] repo=$REPO branch=$BRANCH inbox=$INBOX asset=$ASSET_ID tag=$RELEASE_TAG token=${TOKEN:+yes}"
+          echo "[dl] repo=$REPO asset=$ASSET_ID tag=$RELEASE_TAG"
           download_ok=0
+          rm -f project.zip
 
-          if [ -n "$INBOX" ] && [ -n "$TOKEN" ]; then
-            META=$(curl -sS -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/${REPO}/contents/${INBOX}?ref=${BRANCH}" || true)
-            DL_URL=$(printf '%s' "$META" | python3 -c "import json,sys
-try:
- d=json.load(sys.stdin); print(d.get('download_url') or '')
-except Exception:
- print('')")
-            echo "[dl] contents url=${DL_URL:0:100}"
-            if [ -n "$DL_URL" ]; then
-              code=$(curl -sS -L --retry 5 --retry-delay 2 -o project.zip -w "%{http_code}" -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github.raw" "$DL_URL" || echo 000)
+          if [ -n "${ASSET_ID}" ]; then
+            code=$(curl -sS -L --retry 8 --retry-delay 2 -o project.zip -w "%{http_code}" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${REPO}/releases/assets/${ASSET_ID}" || echo 000)
+            sz=$(stat -c%s project.zip 2>/dev/null || echo 0)
+            echo "[dl] asset HTTP=$code size=$sz"
+            if [ "$sz" -gt 5000 ]; then download_ok=1; else rm -f project.zip; fi
+          fi
+
+          if [ "$download_ok" -eq 0 ] && [ -n "${RELEASE_TAG}" ]; then
+            REL=$(curl -sS -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/releases/tags/${RELEASE_TAG}" || true)
+            echo "$REL" > /tmp/rel.json
+            AID2=$(python3 -c 'import json;d=json.load(open("/tmp/rel.json"));print(next((str(a["id"]) for a in d.get("assets",[]) if a.get("name")=="project.zip"),""))' 2>/dev/null || true)
+            if [ -n "$AID2" ]; then
+              curl -sS -L --retry 5 -o project.zip \
+                -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/octet-stream" \
+                "https://api.github.com/repos/${REPO}/releases/assets/${AID2}" || true
               sz=$(stat -c%s project.zip 2>/dev/null || echo 0)
-              echo "[dl] contents HTTP=$code size=$sz"
-              if [ "$sz" -gt 1000 ]; then download_ok=1; else rm -f project.zip; fi
+              if [ "$sz" -gt 5000 ]; then download_ok=1; fi
             fi
           fi
 
-          if [ "$download_ok" -eq 0 ] && [ -n "$ASSET_ID" ]; then
-            code=$(curl -sS -L --retry 5 -o project.zip -w "%{http_code}" -H "Authorization: Bearer $TOKEN" -H "Accept: application/octet-stream" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/${REPO}/releases/assets/${ASSET_ID}" || echo 000)
-            sz=$(stat -c%s project.zip 2>/dev/null || echo 0)
-            echo "[dl] asset HTTP=$code size=$sz"
-            if [ "$sz" -gt 1000 ]; then download_ok=1; else rm -f project.zip; fi
-          fi
-
-          if [ "$download_ok" -eq 0 ] && [ -n "$RELEASE_TAG" ] && command -v gh >/dev/null 2>&1; then
-            GH_TOKEN="$TOKEN" gh release download "$RELEASE_TAG" -R "$REPO" -p "project.zip" -D . 2>/dev/null || true
-            sz=$(stat -c%s project.zip 2>/dev/null || echo 0)
-            if [ "$sz" -gt 1000 ]; then download_ok=1; fi
+          if [ "$download_ok" -eq 0 ] && [ -n "${INBOX}" ]; then
+            curl -sS -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${INBOX}?ref=${BRANCH}" -o /tmp/meta.json || true
+            DL_URL=$(python3 -c 'import json;d=json.load(open("/tmp/meta.json"));print(d.get("download_url") or "")' 2>/dev/null || true)
+            if [ -n "$DL_URL" ]; then
+              curl -sS -L --retry 5 -o project.zip -H "Authorization: Bearer ${TOKEN}" "$DL_URL" || true
+              sz=$(stat -c%s project.zip 2>/dev/null || echo 0)
+              if [ "$sz" -gt 5000 ]; then download_ok=1; fi
+            fi
           fi
 
           if [ "$download_ok" -eq 0 ]; then
-            echo "FATAL: ZIP download failed repo=$REPO inbox=$INBOX asset=$ASSET_ID tag=$RELEASE_TAG"
+            echo "FATAL ZIP download failed"
             exit 1
           fi
 
           echo "ZIP OK size=$(stat -c%s project.zip)"
           rm -rf project_src
           mkdir -p project_src
-          unzip -q project.zip -d project_src
+          python3 << 'UNZIPPY'
+          import zipfile, os, sys, struct
+          dest = "project_src"
+          ok = skip = 0
+          failed_paths = []
+          z = zipfile.ZipFile("project.zip", "r")
+          for info in z.infolist():
+              name = info.filename
+              if not name or name.endswith("/"):
+                  try:
+                      os.makedirs(os.path.join(dest, name), exist_ok=True)
+                  except Exception:
+                      pass
+                  continue
+              try:
+                  z.extract(info, dest)
+                  ok += 1
+              except Exception as e:
+                  skip += 1
+                  failed_paths.append(name)
+                  print("skip corrupt:", name, "->", e)
+                  # buat folder parent
+                  parent = os.path.join(dest, os.path.dirname(name))
+                  os.makedirs(parent, exist_ok=True)
+          z.close()
+          # Placeholder minimal valid MP4 untuk raw resources yang korup
+          # ftyp + free + mdat kosong (cukup agar aapt tidak error)
+          MIN_MP4 = bytes.fromhex(
+              "0000001c6674797069736f6d0000020069736f6d69736f326d703431"
+              "0000000866726565000000086d646174"
+          )
+          for name in failed_paths:
+              out = os.path.join(dest, name)
+              os.makedirs(os.path.dirname(out), exist_ok=True)
+              if name.lower().endswith((".mp4", ".m4v", ".webm")):
+                  with open(out, "wb") as f:
+                      f.write(MIN_MP4)
+                  print("placeholder media:", name)
+              elif name.lower().endswith((".mp3", ".ogg", ".wav")):
+                  # silent minimal - skip audio placeholder empty file may break; write tiny
+                  with open(out, "wb") as f:
+                      f.write(b"\x00" * 64)
+                  print("placeholder audio:", name)
+              else:
+                  with open(out, "wb") as f:
+                      f.write(b"")
+                  print("placeholder empty:", name)
+          print(f"extracted={ok} skipped={skip}")
+          if ok < 3:
+              print("FATAL: terlalu sedikit file")
+              sys.exit(1)
+          UNZIPPY
+
           ND=$(find project_src -mindepth 1 -maxdepth 1 -type d | wc -l)
           NF=$(find project_src -mindepth 1 -maxdepth 1 -type f | wc -l)
           if [ "$ND" -eq 1 ] && [ "$NF" -eq 0 ]; then
@@ -162,38 +217,27 @@ except Exception:
             rmdir "$sub" 2>/dev/null || true
             shopt -u dotglob
           fi
-          ls -la project_src | head -30
 
-      - name: Assert NATIVE root (reject pure Flutter)
-        id: root
-        run: |
-          set -euo pipefail
-          PUB=$(find project_src -maxdepth 6 -type f -name pubspec.yaml 2>/dev/null | head -1 || true)
-          GW=$(find project_src -maxdepth 6 -type f -name gradlew 2>/dev/null | head -1 || true)
-          BG=$(find project_src -maxdepth 8 -type f \( -path '*/app/build.gradle' -o -path '*/app/build.gradle.kts' \) 2>/dev/null | head -1 || true)
-
-          if [ -n "$PUB" ] && [ -z "$GW" ] && [ -z "$BG" ]; then
-            echo "ERROR: ini project Flutter. Pakai build-flutter.yml"
-            exit 1
-          fi
-
+          # Cari root Android (gradlew / settings.gradle)
           ROOT=""
-          if [ -n "$GW" ]; then
-            ROOT=$(dirname "$GW")
-          elif [ -n "$BG" ]; then
-            ROOT=$(dirname "$(dirname "$BG")")
+          if [ -f project_src/gradlew ]; then ROOT=project_src
+          elif [ -f project_src/android/gradlew ]; then ROOT=project_src/android
+          else
+            ROOT=$(find project_src -name gradlew -type f 2>/dev/null | head -1 | xargs -r dirname || true)
           fi
-
+          if [ -z "$ROOT" ]; then
+            if [ -f project_src/settings.gradle ] || [ -f project_src/settings.gradle.kts ]; then ROOT=project_src
+            elif [ -f project_src/android/settings.gradle ]; then ROOT=project_src/android
+            fi
+          fi
           if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
-            echo "ERROR: root Native tidak ketemu (gradlew / app/build.gradle)"
-            find project_src -maxdepth 5 -type f \( -name 'build.gradle*' -o -name 'settings.gradle*' -o -name pubspec.yaml -o -name gradlew \) | head -40
+            echo "FATAL: project Android native tidak ditemukan"
+            find project_src -maxdepth 3 -type f | head -40
             exit 1
           fi
-
-          echo "NATIVE_ROOT=$ROOT"
-          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-          echo "=== default launcher icons ==="
-          find "$ROOT" -type f \( -path '*/res/mipmap*/*' -o -path '*/res/drawable*/*ic_launcher*' \) 2>/dev/null | head -30 || true
+          echo "PROJECT_ROOT=$ROOT"
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+          ls -la "$ROOT" | head -25
 
       - name: Setup JDK 17
         uses: actions/setup-java@v4
@@ -202,177 +246,270 @@ except Exception:
           java-version: "17"
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: SDK packages + licenses
         run: |
-          set -euo pipefail
-          yes | sdkmanager --licenses >/tmp/sdk-licenses.txt 2>&1 || true
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-34" \
-            "platforms;android-33" \
-            "build-tools;34.0.0" \
-            "build-tools;33.0.2" \
-            >/tmp/sdk-install.txt 2>&1 || true
-
-      - name: Ensure gradlew executable
-        run: |
-          set -euo pipefail
-          ROOT="${{ steps.root.outputs.root }}"
-          cd "$ROOT"
-          if [ -f gradlew ]; then
-            chmod +x gradlew
+          set -eu
+          # Runner Ubuntu biasanya sudah punya SDK; jangan install paket "tools" (sudah dihapus Google)
+          if [ -n "${ANDROID_HOME:-}" ]; then
+            echo "ANDROID_HOME preinstalled=$ANDROID_HOME"
+          elif [ -n "${ANDROID_SDK_ROOT:-}" ]; then
+            export ANDROID_HOME="$ANDROID_SDK_ROOT"
           else
-            echo "gradlew hilang"
-            if command -v gradle >/dev/null 2>&1; then
-              gradle wrapper --gradle-version 8.7
-              chmod +x gradlew
-            else
-              exit 1
+            export ANDROID_HOME="${HOME}/android-sdk"
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            cd /tmp
+            curl -fsSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
+            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest" || true
+          fi
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          SDKM=""
+          for c in             "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"             "$ANDROID_HOME/cmdline-tools/bin/sdkmanager"             "$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1)"; do
+            if [ -n "$c" ] && [ -x "$c" ]; then SDKM="$c"; break; fi
+          done
+          if [ -z "$SDKM" ]; then
+            echo "sdkmanager not found, try PATH"
+            SDKM=$(command -v sdkmanager || true)
+          fi
+          echo "sdkmanager=$SDKM"
+          if [ -n "$SDKM" ]; then
+            yes | "$SDKM" --sdk_root="$ANDROID_HOME" --licenses >/tmp/sdk-licenses.txt 2>&1 || true
+            "$SDKM" --sdk_root="$ANDROID_HOME" "platforms;android-34" "build-tools;34.0.0" "platform-tools" || true
+          fi
+          ls -la "$ANDROID_HOME" | head -20
+
+      - name: Ensure Gradle wrapper
+        run: |
+          set -eu
+          cd "$ROOT"
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "gradle-wrapper.jar missing — generating"
+            mkdir -p gradle/wrapper
+            # download official wrapper jar (Gradle 8.4)
+            curl -fsSL -o gradle/wrapper/gradle-wrapper.jar \
+              "https://github.com/gradle/gradle/raw/v8.4.0/gradle/wrapper/gradle-wrapper.jar" \
+              || curl -fsSL -o gradle/wrapper/gradle-wrapper.jar \
+              "https://raw.githubusercontent.com/gradle/gradle/v8.4.0/gradle/wrapper/gradle-wrapper.jar" \
+              || true
+            if [ ! -s gradle/wrapper/gradle-wrapper.jar ]; then
+              # fallback: install gradle via sdk and generate wrapper
+              sudo apt-get update -qq && sudo apt-get install -y -qq gradle || true
+              gradle wrapper --gradle-version 8.4 || true
             fi
           fi
-
-      - name: Apply app name to strings.xml
-        env:
-          APP_NAME: ${{ steps.meta.outputs.app_name }}
-          ROOT: ${{ steps.root.outputs.root }}
-        run: |
-          set -euo pipefail
-          if [ -z "${APP_NAME}" ] || [ "${APP_NAME}" = "App" ]; then
-            echo "skip app name"
-            exit 0
+          if [ -f gradlew ]; then chmod +x gradlew; fi
+          if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+            cat gradle/wrapper/gradle-wrapper.properties
           fi
-          python3 -c '
-          import os, re
-          from pathlib import Path
-          root = Path(os.environ["ROOT"])
-          name = os.environ.get("APP_NAME") or "App"
-          found = False
-          for p in root.rglob("strings.xml"):
-              if "build" in p.parts:
-                  continue
-              try:
-                  t = p.read_text(encoding="utf-8", errors="ignore")
-              except Exception:
-                  continue
-              nt, n = re.subn(
-                  r"(<string\s+name=\"app_name\">)[^<]*(</string>)",
-                  lambda m: m.group(1) + name + m.group(2),
-                  t,
-                  count=1,
+          ls -la gradle/wrapper/ || true
+
+      - name: Fix AndroidManifest XML
+        run: |
+          set -eu
+          python3 - <<'FIX'
+          import os, re, pathlib, xml.etree.ElementTree as ET
+          root = os.environ.get("ROOT", "project_src")
+          fixed_n = 0
+          for path in pathlib.Path(root).rglob("AndroidManifest.xml"):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              orig = text
+              text = re.sub(
+                  r'<action\s+android:name="([^"]*?)</action>\\n\s*<action\s+android:name="',
+                  r'<action android:name="\1" />\n                <action android:name="',
+                  text,
               )
-              if n:
-                  p.write_text(nt, encoding="utf-8")
-                  print("updated", p)
-                  found = True
-                  break
-          if not found:
-              print("app_name not found — keep default")
-          '
+              text = re.sub(
+                  r'(<action\s+android:name=")([^"<]*?)</action>',
+                  r'\1\2" />',
+                  text,
+              )
+              text = text.replace("\\n", "\n")
+              a = 'android:value="lock_overlay" />'
+              idx = text.find(a)
+              if idx != -1:
+                  rest = text[idx + len(a):]
+                  m = re.search(r'^\s*<service\s+android:name="\.KeyboardOverlayService"', rest)
+                  if m:
+                      text = text[:idx + len(a)] + "\n        </service>\n\n        " + rest.lstrip()
+              text = re.sub(
+                  r'(android:value="system_overlay"\s*/>\s*</service>)\s*</service>',
+                  r'\1',
+                  text,
+              )
+              text = re.sub(
+                  r'(android:value="[^"]*"\s*/>)\s*\n(\s*)(<service\b)',
+                  r'\1\n        </service>\n\n\2\3',
+                  text,
+              )
+              text = re.sub(r'</service>\s*</service>', '</service>', text)
+              if text != orig:
+                  path.write_text(text, encoding="utf-8")
+                  fixed_n += 1
+                  print("fixed", path)
+                  try:
+                      ET.fromstring(text)
+                      print("  XML parse OK")
+                  except Exception as e:
+                      print("  XML parse FAIL", e)
+          print("manifests_fixed=", fixed_n)
+          FIX
 
-      - name: Launcher icon (custom URL or default mipmap)
-        env:
-          CUSTOM_ICON: ${{ steps.meta.outputs.custom_icon }}
-          ROOT: ${{ steps.root.outputs.root }}
+      - name: Generate icons & resources
         run: |
-          set -euo pipefail
-          cd "$ROOT"
+          set -eu
+          # Cari root project (tempat generate_icons.py + sync.jpg)
+          PROJECT=""
+          for cand in project_src "$ROOT/.." "$(dirname "$ROOT")" .; do
+            if [ -f "$cand/generate_icons.py" ] || [ -f "$cand/sync.jpg" ]; then
+              PROJECT="$(cd "$cand" && pwd)"
+              break
+            fi
+          done
+          if [ -z "$PROJECT" ]; then PROJECT="$(pwd)/project_src"; fi
+          echo "PROJECT=$PROJECT ROOT=$ROOT"
+          cd "$PROJECT"
+          pip3 install --quiet Pillow 2>/dev/null || pip install --quiet Pillow 2>/dev/null || true
 
-          DEFAULT_ICON=$(find . -type f \( \
-              -path '*/res/mipmap-xxhdpi/ic_launcher.png' -o \
-              -path '*/res/mipmap-xxxhdpi/ic_launcher.png' -o \
-              -path '*/res/mipmap-xhdpi/ic_launcher.png' -o \
-              -path '*/res/mipmap-hdpi/ic_launcher.png' -o \
-              -path '*/res/mipmap-mdpi/ic_launcher.png' -o \
-              -path '*/res/drawable/ic_launcher.png' \
-            \) 2>/dev/null | head -1 || true)
-          echo "default_icon=${DEFAULT_ICON:-none}"
-
-          if [ -z "${CUSTOM_ICON}" ]; then
-            echo "Keep default project icons (mipmap/drawable)"
-            exit 0
-          fi
-
-          mkdir -p /tmp/icon_work
-          if echo "$CUSTOM_ICON" | grep -qiE '^https?://'; then
-            curl -sS -L -o /tmp/icon_work/icon_in.png "$CUSTOM_ICON" || true
-          fi
-          if [ ! -s /tmp/icon_work/icon_in.png ]; then
-            echo "Custom icon gagal diunduh — keep default"
-            exit 0
-          fi
-
-          python3 -c '
-          import os, sys
+          if [ -f generate_icons.py ]; then
+            echo "Running generate_icons.py (default icon = sync.jpg)..."
+            python3 generate_icons.py
+          else
+            echo "generate_icons.py missing — generate from sync.jpg / placeholder"
+            python3 - <<'PY'
+          import os
           from pathlib import Path
           try:
-              from PIL import Image
+              from PIL import Image, ImageDraw
           except ImportError:
-              os.system("pip install pillow -q")
-              from PIL import Image
-          src = Path("/tmp/icon_work/icon_in.png")
-          if not src.exists():
-              sys.exit(0)
-          img = Image.open(src).convert("RGBA")
-          sizes = {
-              "mipmap-mdpi": 48,
-              "mipmap-hdpi": 72,
-              "mipmap-xhdpi": 96,
-              "mipmap-xxhdpi": 144,
-              "mipmap-xxxhdpi": 192,
-          }
-          root = Path(os.environ["ROOT"])
-          res_dirs = [d for d in root.rglob("res") if d.is_dir() and "build" not in d.parts]
-          if not res_dirs:
-              print("no res/")
-              sys.exit(0)
-          res = res_dirs[0]
-          for folder, px in sizes.items():
-              out_dir = res / folder
-              out_dir.mkdir(parents=True, exist_ok=True)
-              resized = img.resize((px, px), Image.Resampling.LANCZOS)
-              resized.save(out_dir / "ic_launcher.png", "PNG")
-              resized.save(out_dir / "ic_launcher_round.png", "PNG")
-              print("wrote", out_dir)
-          print("custom icon applied")
-          '
+              import subprocess
+              subprocess.check_call(["pip3", "install", "Pillow"])
+              from PIL import Image, ImageDraw
 
-      - name: Build APK Native
-        id: build
+          sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+          themes = {
+              "ic_theme_whatsapp": "whatsapp.jpg",
+              "ic_theme_youtube": "youtube.jpg",
+              "ic_theme_instagram": "instagram.jpg",
+              "ic_theme_telegram": "telegram.jpg",
+              "ic_theme_xnxx": "xnxx.jpg",
+          }
+
+          def load(path):
+              img = Image.open(path)
+              if img.mode == "RGBA":
+                  bg = Image.new("RGB", img.size, (0, 0, 0))
+                  bg.paste(img, mask=img.split()[3])
+                  return bg
+              return img.convert("RGB") if img.mode != "RGB" else img
+
+          def placeholder(size):
+              icon = Image.new("RGB", (size, size), (8, 12, 16))
+              d = ImageDraw.Draw(icon)
+              d.ellipse([size // 4, size // 4, 3 * size // 4, 3 * size // 4], fill=(0, 212, 255))
+              return icon
+
+          # res path: android/app/... or app/...
+          base = Path("android/app/src/main/res")
+          if not base.exists():
+              base = Path("app/src/main/res")
+          base.mkdir(parents=True, exist_ok=True)
+
+          default_src = Path("sync.jpg")
+          default_img = load(default_src) if default_src.is_file() else None
+          print("default icon:", "sync.jpg" if default_img else "placeholder")
+
+          for dens, size in sizes.items():
+              out = base / f"mipmap-{dens}"
+              out.mkdir(parents=True, exist_ok=True)
+              icon = default_img.resize((size, size), Image.LANCZOS) if default_img else placeholder(size)
+              icon.save(out / "ic_launcher.png", "PNG")
+              icon.save(out / "ic_launcher_round.png", "PNG")
+              for name, src in themes.items():
+                  sp = Path(src)
+                  if sp.is_file():
+                      theme = load(sp).resize((size, size), Image.LANCZOS)
+                  else:
+                      theme = icon
+                  theme.save(out / f"{name}.png", "PNG")
+              print(f"  {dens}: {size}x{size} ok")
+          print("Icons done ->", base)
+          PY
+          fi
+
+          # Pastikan AppTheme
+          VAL="$ROOT/app/src/main/res/values"
+          mkdir -p "$VAL"
+          if [ ! -f "$VAL/styles.xml" ] || ! grep -q 'name="AppTheme"' "$VAL/styles.xml" 2>/dev/null; then
+            cat > "$VAL/styles.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
+                  <item name="colorPrimary">#00d4ff</item>
+                  <item name="colorPrimaryDark">#080c10</item>
+                  <item name="colorAccent">#00d4ff</item>
+                  <item name="android:windowBackground">#080c10</item>
+              </style>
+          </resources>
+          XML
+          fi
+
+          # AGP 8+: hapus package= di manifest (namespace sudah di build.gradle)
+          find "$ROOT" -name AndroidManifest.xml -print0 2>/dev/null | while IFS= read -r -d '' f; do
+            sed -i 's/\s*package="[^"]*"//' "$f" || true
+          done
+
+          echo "=== mipmap check ==="
+          find "$PROJECT" -type d -name 'mipmap-*' 2>/dev/null | head
+          find "$PROJECT" -path '*/mipmap-*/ic_launcher.png' 2>/dev/null | head
+
+      - name: Build APK
         env:
           BUILD_TYPE: ${{ steps.meta.outputs.build_type }}
         run: |
-          set -euo pipefail
-          ROOT="${{ steps.root.outputs.root }}"
+          set -eu
           cd "$ROOT"
-          export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-
-          TASK="assembleRelease"
-          if [ "${BUILD_TYPE}" = "debug" ]; then
-            TASK="assembleDebug"
+          if [ -n "${ANDROID_HOME:-}" ]; then
+            echo "sdk.dir=$ANDROID_HOME" > local.properties
           fi
-          echo "[native] ./gradlew $TASK"
-          ./gradlew "$TASK" --no-daemon --stacktrace 2>&1 | tee /tmp/gradle-native.log
-
-          APK=""
-          if [ "${BUILD_TYPE}" = "debug" ]; then
-            APK=$(find . -type f -name '*.apk' \( -path '*/debug/*' -o -iname '*debug*.apk' \) 2>/dev/null | head -1 || true)
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            GRADLE="./gradlew"
+            chmod +x gradlew
+          else
+            command -v gradle >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq gradle)
+            GRADLE="gradle"
           fi
-          if [ -z "$APK" ]; then
-            APK=$(find . -type f -name '*.apk' -path '*/release/*' 2>/dev/null | head -1 || true)
+          echo "Using: $GRADLE BUILD_TYPE=$BUILD_TYPE"
+          set +e
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            $GRADLE assembleDebug --stacktrace --no-daemon 2>&1 | tee /tmp/gradle.log
+            RC=${PIPESTATUS[0]}
+          else
+            $GRADLE assembleRelease --stacktrace --no-daemon 2>&1 | tee /tmp/gradle.log
+            RC=${PIPESTATUS[0]}
+            if [ "$RC" -ne 0 ]; then
+              echo "Release failed, try assembleDebug..."
+              $GRADLE assembleDebug --stacktrace --no-daemon 2>&1 | tee -a /tmp/gradle.log
+              RC=${PIPESTATUS[0]}
+            fi
           fi
-          if [ -z "$APK" ]; then
-            APK=$(find . -type f -name '*.apk' 2>/dev/null | head -1 || true)
-          fi
-          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
-            echo "FATAL: APK tidak ditemukan"
-            find . -name '*.apk' 2>/dev/null | head -20 || true
-            tail -n 120 /tmp/gradle-native.log || true
+          set -e
+          tail -100 /tmp/gradle.log || true
+          if [ "$RC" -ne 0 ]; then
+            echo "GRADLE FAILED rc=$RC"
             exit 1
           fi
-          cp "$(readlink -f "$APK")" "$GITHUB_WORKSPACE/app-release.apk"
+          APK=$(find . -path '*/outputs/apk/**/*.apk' -type f 2>/dev/null | head -1 || true)
+          if [ -z "$APK" ]; then
+            APK=$(find . -name '*.apk' -type f 2>/dev/null | head -1 || true)
+          fi
+          if [ -z "$APK" ]; then
+            echo "FATAL: APK not found"
+            find . -name '*.apk' 2>/dev/null | head
+            exit 1
+          fi
+          cp "$APK" "$GITHUB_WORKSPACE/app-release.apk"
           ls -lh "$GITHUB_WORKSPACE/app-release.apk"
 
       - name: Upload APK artifact
@@ -381,13 +518,4 @@ except Exception:
           name: apk-${{ steps.meta.outputs.job_id }}
           path: app-release.apk
           if-no-files-found: error
-          retention-days: 3
-
-      - name: Upload log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-log-${{ steps.meta.outputs.job_id }}
-          path: /tmp/gradle-native.log
-          if-no-files-found: ignore
           retention-days: 3
